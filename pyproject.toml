@@ -1,0 +1,19 @@
+[project]
+name = "perf-cli"
+version = "0.1.0"
+description = "Lightweight performance monitoring CLI with background sampling and terminal charting"
+requires-python = ">=3.8"
+dependencies = [
+    "psutil>=5.8.0",
+]
+
+[project.scripts]
+perf-cli = "perf_cli.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["perf_cli*"]
