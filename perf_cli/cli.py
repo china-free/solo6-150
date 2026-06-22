@@ -9,8 +9,10 @@ from typing import List, Optional
 from . import __version__
 from .chart import ChartConfig, Series, render_line_chart
 from .daemon import get_status, start_background, stop_background
+from .event_bus import MetricEventBus
 from .sampler import MetricsSampler, SamplerConfig
-from .storage import MetricsStore, RetentionConfig
+from .storage import MetricsStore
+from .storage_base import RetentionConfig
 from .utils import format_duration, parse_duration
 
 
@@ -59,23 +61,28 @@ def cmd_collect(args: argparse.Namespace) -> int:
         print("perf-cli: Starting foreground sampling (Ctrl+C to stop)...")
         print(f"perf-cli: Retention: {retention.retention_days} days, "
               f"compaction after {format_duration(retention.compaction_age_seconds)}")
-        cfg = SamplerConfig(
-            interval=args.interval,
-            include_per_cpu=args.per_cpu,
-            disk_filter=set(disks) if disks else None,
-            net_filter=set(nets) if nets else None,
-            enable_maintenance=not args.no_maintenance,
-            retention=retention,
-        )
-        with MetricsStore(retention=retention) as store:
-            run_id = store.start_run(0)
-            sampler = MetricsSampler(store, cfg)
-            try:
-                sampler.run()
-            except KeyboardInterrupt:
-                pass
-            finally:
-                store.end_run(run_id)
+
+        with MetricEventBus() as bus:
+            with MetricsStore(retention=retention) as store:
+                store.subscribe_to_bus(bus)
+                if not args.no_maintenance:
+                    store.start_maintenance()
+
+                run_id = store.start_run(0)
+                cfg = SamplerConfig(
+                    interval=args.interval,
+                    include_per_cpu=args.per_cpu,
+                    disk_filter=set(disks) if disks else None,
+                    net_filter=set(nets) if nets else None,
+                )
+                sampler = MetricsSampler(bus, cfg)
+                try:
+                    sampler.run()
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    bus.flush_all(timeout=3.0)
+                    store.end_run(run_id)
         print("\nperf-cli: Sampling stopped.")
     else:
         try:

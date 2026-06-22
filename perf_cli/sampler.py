@@ -1,17 +1,17 @@
-"""Lightweight system metrics sampler using psutil with background maintenance."""
+"""Lightweight system metrics sampler using psutil.
 
-import threading
+Pure producer: collects metrics and publishes them to an event bus.
+No knowledge of storage or persistence - that's the consumer's job.
+"""
+
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import psutil
 
-from .storage import MetricPoint, MetricsStore, RetentionConfig
-
-
-MAINTENANCE_INTERVAL_SECONDS = 3600  # Run cleanup/compaction once per hour
-MAINTENANCE_INITIAL_DELAY = 300  # Wait 5 min before first maintenance to avoid interfering with startup
+from .event_bus import MetricEventBus
+from .storage_base import MetricPoint
 
 
 @dataclass
@@ -26,9 +26,6 @@ class SamplerConfig:
     include_net_io: bool = True
     disk_filter: Optional[Set[str]] = None
     net_filter: Optional[Set[str]] = None
-    enable_maintenance: bool = True
-    maintenance_interval: int = MAINTENANCE_INTERVAL_SECONDS
-    retention: Optional[RetentionConfig] = None
 
 
 @dataclass
@@ -40,22 +37,25 @@ class _IOSnapshot:
 
 
 class MetricsSampler:
-    """Samples system metrics at regular intervals and stores them.
+    """Samples system metrics and publishes them to an event bus.
 
-    Designed to be extremely lightweight: minimal CPU overhead, batched writes,
-    and a low-priority background thread for database maintenance (compaction
-    and purging old data) that won't interfere with sampling.
+    Pure producer role:
+    - Collects CPU, memory, disk IO, network IO at configurable intervals
+    - Publishes MetricPoint events to the event bus
+    - Does NOT know or care who consumes the data
+    - Designed to be extremely lightweight and never blocked by slow consumers
     """
 
-    def __init__(self, store: MetricsStore, config: Optional[SamplerConfig] = None):
-        self._store = store
+    def __init__(
+        self,
+        bus: MetricEventBus,
+        config: Optional[SamplerConfig] = None,
+    ):
+        self._bus = bus
         self._config = config or SamplerConfig()
         self._last_io = _IOSnapshot()
         self._running = False
-        self._stop_event = threading.Event()
-        self._maintenance_thread: Optional[threading.Thread] = None
-        self._last_maintenance = 0.0
-        self._maintenance_stats: List[Dict] = []
+        self._sample_count = 0
 
     def _collect_cpu(self, now_ts: int) -> List[MetricPoint]:
         points = []
@@ -154,7 +154,10 @@ class MetricsSampler:
         return points
 
     def sample_once(self) -> List[MetricPoint]:
-        """Collect one sample of all configured metrics."""
+        """Collect one sample of all configured metrics and publish to the bus.
+
+        Returns the list of points collected (for debugging/testing).
+        """
         now_ts = int(time.time())
         points: List[MetricPoint] = []
 
@@ -164,100 +167,29 @@ class MetricsSampler:
         points.extend(self._collect_net_io(now_ts))
 
         self._last_io.timestamp = time.time()
+
+        if points:
+            self._bus.publish(points)
+            self._sample_count += 1
+
         return points
 
-    def _run_maintenance(self) -> None:
-        """Background thread: periodically compact and purge old data.
-
-        Runs at low priority to avoid interfering with sampling.
-        """
-        if not self._config.enable_maintenance:
-            return
-
-        next_run = time.monotonic() + MAINTENANCE_INITIAL_DELAY
-
-        while not self._stop_event.is_set():
-            try:
-                if time.monotonic() >= next_run:
-                    start = time.monotonic()
-                    stats = {}
-
-                    try:
-                        compact_stats = self._store.compact()
-                        stats["compact"] = compact_stats
-                    except Exception as e:
-                        stats["compact"] = {"status": "error", "error": str(e)}
-
-                    try:
-                        purged = self._store.purge_older_than()
-                        stats["purged_rows"] = purged
-                    except Exception as e:
-                        stats["purge"] = {"status": "error", "error": str(e)}
-
-                    stats["duration_seconds"] = round(time.monotonic() - start, 3)
-                    stats["timestamp"] = int(time.time())
-
-                    try:
-                        counts = self._store.get_row_counts()
-                        sizes = self._store.get_db_size()
-                        stats["row_counts"] = counts
-                        stats["db_size_mb"] = round(sizes["total"] / (1024 * 1024), 2)
-                    except Exception:
-                        pass
-
-                    self._maintenance_stats.append(stats)
-                    if len(self._maintenance_stats) > 10:
-                        self._maintenance_stats.pop(0)
-
-                    next_run = time.monotonic() + self._config.maintenance_interval
-
-                sleep_until = next_run
-                while time.monotonic() < sleep_until:
-                    if self._stop_event.is_set():
-                        return
-                    sleep_for = min(1.0, sleep_until - time.monotonic())
-                    time.sleep(sleep_for)
-            except Exception:
-                time.sleep(60)
-                next_run = time.monotonic() + self._config.maintenance_interval
-
-    def get_maintenance_stats(self) -> List[Dict]:
-        """Get the history of maintenance operations."""
-        return list(self._maintenance_stats)
-
-    def trigger_maintenance(self, force: bool = False) -> None:
-        """Trigger maintenance immediately (for testing)."""
-        if force:
-            self._last_maintenance = 0.0
-        try:
-            self._store.compact(force=True)
-            self._store.purge_older_than()
-        except Exception:
-            pass
-
-    def run(self, stop_flag: Optional[Callable[[], bool]] = None) -> None:
+    def run(self, stop_flag=None) -> None:
         """Run the sampling loop until stop_flag is set or KeyboardInterrupt.
 
         stop_flag: optional callable returning bool, checked each iteration.
+
+        The sampler never blocks on consumers. If a subscriber's queue is
+        full, data for that subscriber is silently dropped - we prioritize
+        sampling accuracy over delivery guarantees.
         """
         self._running = True
-        self._stop_event.clear()
         self.sample_once()
-
-        if self._config.enable_maintenance:
-            self._maintenance_thread = threading.Thread(
-                target=self._run_maintenance,
-                name="perf_cli_maintenance",
-                daemon=True,
-            )
-            self._maintenance_thread.start()
 
         try:
             while self._running:
                 start = time.monotonic()
-                points = self.sample_once()
-                if points:
-                    self._store.insert_batch(points)
+                self.sample_once()
 
                 elapsed = time.monotonic() - start
                 sleep_for = max(0.0, self._config.interval - elapsed)
@@ -267,9 +199,6 @@ class MetricsSampler:
                         if stop_flag is not None and stop_flag():
                             self._running = False
                             break
-                        if self._stop_event.is_set():
-                            self._running = False
-                            break
                         time.sleep(min(0.05, end_deadline - time.monotonic()))
                 if stop_flag is not None and stop_flag():
                     self._running = False
@@ -277,10 +206,10 @@ class MetricsSampler:
             pass
         finally:
             self._running = False
-            self._stop_event.set()
-            if self._maintenance_thread is not None:
-                self._maintenance_thread.join(timeout=5.0)
 
     def stop(self) -> None:
         self._running = False
-        self._stop_event.set()
+
+    @property
+    def sample_count(self) -> int:
+        return self._sample_count

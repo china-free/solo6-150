@@ -1,4 +1,10 @@
-"""Background daemon worker entry point - called by daemon.py via subprocess."""
+"""Background daemon worker entry point - called by daemon.py via subprocess.
+
+Uses the event bus architecture:
+- MetricEventBus: central event hub
+- MetricsSampler: producer, publishes metrics to the bus
+- MetricsStore: consumer, subscribes and persists to SQLite
+"""
 
 import json
 import os
@@ -7,8 +13,10 @@ import sys
 import time
 
 from .daemon import clear_pid, write_pid
+from .event_bus import MetricEventBus
 from .sampler import MetricsSampler, SamplerConfig
-from .storage import MetricsStore, RetentionConfig
+from .storage import MetricsStore
+from .storage_base import RetentionConfig
 
 
 def _handler(signum, frame):
@@ -45,17 +53,26 @@ def main():
 
         write_pid(os.getpid())
 
-        store = MetricsStore(db_path, retention=retention_cfg)
-        run_id = store.start_run(os.getpid())
-        sampler_cfg = SamplerConfig(
-            interval=interval,
-            disk_filter=disk_filter,
-            net_filter=net_filter,
-            enable_maintenance=enable_maintenance,
-            retention=retention_cfg,
-        )
-        sampler = MetricsSampler(store, sampler_cfg)
-        sampler.run()
+        with MetricEventBus() as bus:
+            with MetricsStore(db_path, retention=retention_cfg) as store:
+                store.subscribe_to_bus(bus)
+                if enable_maintenance:
+                    store.start_maintenance()
+
+                run_id = store.start_run(os.getpid())
+                sampler_cfg = SamplerConfig(
+                    interval=interval,
+                    disk_filter=disk_filter,
+                    net_filter=net_filter,
+                )
+                sampler = MetricsSampler(bus, sampler_cfg)
+                try:
+                    sampler.run()
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    bus.flush_all(timeout=5.0)
+                    store.end_run(run_id)
     except KeyboardInterrupt:
         pass
     except Exception as e:
@@ -70,10 +87,6 @@ def main():
         except Exception:
             pass
     finally:
-        try:
-            store.end_run(run_id)
-        except Exception:
-            pass
         clear_pid()
 
 

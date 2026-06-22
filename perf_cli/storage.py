@@ -1,4 +1,10 @@
-"""Lightweight SQLite-backed time-series storage with automatic compaction and retention."""
+"""Lightweight SQLite-backed time-series storage with automatic compaction and retention.
+
+Acts as a consumer on the event bus: subscribes to metric events,
+batches them efficiently, and persists to SQLite.
+
+Also manages its own background maintenance thread for compaction and purging.
+"""
 
 import sqlite3
 import threading
@@ -7,31 +13,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .storage_base import (
+    DEFAULT_DB_PATH,
+    DEFAULT_RETENTION_DAYS,
+    MetricPoint,
+    RetentionConfig,
+)
 
-DEFAULT_DB_PATH = Path.home() / ".perf_cli" / "metrics.db"
 
-DEFAULT_RETENTION_DAYS = 7
-COMPACTION_AGE_SECONDS = 86400  # 1 day - data older than this gets compacted
-COMPACTION_INTERVAL_SECONDS = 3600  # Run compaction once per hour
 AUTO_CHECKPOINT_INTERVAL = 1000  # Checkpoint after this many writes
+MAINTENANCE_INITIAL_DELAY = 300  # Wait 5 min before first maintenance
+SUBSCRIBER_BATCH_SIZE = 200
+SUBSCRIBER_FLUSH_INTERVAL = 2.0  # seconds
 
 
 @dataclass
-class MetricPoint:
-    """A single metric sample at a point in time."""
-    timestamp: int
-    metric: str
-    value: float
-    tag: str = ""
-
-
-@dataclass
-class RetentionConfig:
-    """Configuration for data retention and compaction."""
-    retention_days: int = DEFAULT_RETENTION_DAYS
-    compaction_age_seconds: int = COMPACTION_AGE_SECONDS
-    compaction_interval_seconds: int = COMPACTION_INTERVAL_SECONDS
-    enable_auto_compaction: bool = True
+class StorageStats:
+    """Runtime statistics for the storage layer."""
+    raw_rows: int
+    compacted_rows: int
+    db_size_bytes: int
+    wal_size_bytes: int
+    last_compaction_ts: int
+    maintenance_runs: int
 
 
 class MetricsStore:
@@ -42,6 +46,15 @@ class MetricsStore:
     - metrics_compacted: 1-minute granularity (min/max/avg) for older data
     - runs: sampling run metadata
     - metadata: key-value store for compaction tracking
+
+    As a consumer:
+    - Subscribe to an event bus via subscribe_to_bus()
+    - Batches incoming points with configurable batch size and flush interval
+    - Uses WAL mode + MMAP for minimal locking and high write throughput
+
+    As an operator:
+    - Queries transparently use both raw and compacted tables
+    - Background maintenance thread handles compaction and retention
     """
 
     def __init__(
@@ -58,6 +71,11 @@ class MetricsStore:
 
         self._conn = self._create_connection()
         self._init_schema()
+
+        self._maintenance_thread: Optional[threading.Thread] = None
+        self._maintenance_stop = threading.Event()
+        self._maintenance_runs = 0
+        self._subscriber_handles: List = []
 
     def _create_connection(self) -> sqlite3.Connection:
         """Create a well-configured SQLite connection to minimize locking."""
@@ -140,6 +158,53 @@ class MetricsStore:
                 cursor.execute("ROLLBACK")
                 raise
 
+    # ------------------------------------------------------------------
+    # Event bus subscription (consumer side)
+    # ------------------------------------------------------------------
+
+    def subscribe_to_bus(
+        self,
+        bus,
+        batch_size: int = SUBSCRIBER_BATCH_SIZE,
+        flush_interval: float = SUBSCRIBER_FLUSH_INTERVAL,
+    ) -> None:
+        """Subscribe to an event bus to receive metric points.
+
+        The store will batch incoming points and flush them periodically.
+        This is the primary write path when used in a production setup.
+
+        Args:
+            bus: MetricEventBus instance
+            batch_size: Max points per batch insert
+            flush_interval: Max seconds between flushes
+        """
+        handle = bus.subscribe(
+            name="storage",
+            handler=self._handle_batch,
+            batch_size=batch_size,
+            flush_interval=flush_interval,
+        )
+        self._subscriber_handles.append(handle)
+
+    def unsubscribe_from_bus(self) -> None:
+        """Unsubscribe from all event buses."""
+        for handle in self._subscriber_handles:
+            try:
+                handle.stop()
+            except Exception:
+                pass
+        self._subscriber_handles.clear()
+
+    def _handle_batch(self, points: List[MetricPoint]) -> None:
+        """Handler called by the event bus subscriber thread."""
+        if not points:
+            return
+        self.insert_batch(points)
+
+    # ------------------------------------------------------------------
+    # Direct write API (for one-off / testing use)
+    # ------------------------------------------------------------------
+
     def insert_batch(self, points: List[MetricPoint]) -> None:
         """Insert a batch of metric points efficiently with batching."""
         if not points:
@@ -161,6 +226,10 @@ class MetricsStore:
             except Exception:
                 cursor.execute("ROLLBACK")
                 raise
+
+    # ------------------------------------------------------------------
+    # Query API
+    # ------------------------------------------------------------------
 
     def query_range(
         self,
@@ -268,6 +337,10 @@ class MetricsStore:
             )
             return [row[0] for row in cursor.fetchall()]
 
+    # ------------------------------------------------------------------
+    # Run tracking
+    # ------------------------------------------------------------------
+
     def start_run(self, pid: int) -> int:
         with self._lock:
             cursor = self._conn.cursor()
@@ -308,6 +381,10 @@ class MetricsStore:
             if row:
                 return {"id": row[0], "start_ts": row[1], "pid": row[2], "status": row[3]}
             return None
+
+    # ------------------------------------------------------------------
+    # Compaction and retention
+    # ------------------------------------------------------------------
 
     def purge_older_than(self, days: Optional[int] = None) -> int:
         """Remove raw data older than N days and compacted data older than 2x N days.
@@ -400,7 +477,74 @@ class MetricsStore:
                 cursor.execute("ROLLBACK")
                 raise
 
+        self._maintenance_runs += 1
         return stats
+
+    # ------------------------------------------------------------------
+    # Background maintenance
+    # ------------------------------------------------------------------
+
+    def start_maintenance(self) -> None:
+        """Start the background maintenance thread (compaction + purge).
+
+        Called automatically when subscribing to a bus, but can also be
+        started manually for standalone use.
+        """
+        if self._maintenance_thread is not None and self._maintenance_thread.is_alive():
+            return
+        if not self._retention.enable_auto_compaction:
+            return
+
+        self._maintenance_stop.clear()
+        self._maintenance_thread = threading.Thread(
+            target=self._maintenance_loop,
+            name="perf_storage_maintenance",
+            daemon=True,
+        )
+        self._maintenance_thread.start()
+
+    def stop_maintenance(self) -> None:
+        """Stop the background maintenance thread."""
+        self._maintenance_stop.set()
+        if self._maintenance_thread is not None and self._maintenance_thread.is_alive():
+            self._maintenance_thread.join(timeout=10.0)
+        self._maintenance_thread = None
+
+    def _maintenance_loop(self) -> None:
+        """Background thread: periodically compact and purge old data.
+
+        Runs at low priority to avoid interfering with writes.
+        """
+        next_run = time.monotonic() + MAINTENANCE_INITIAL_DELAY
+
+        while not self._maintenance_stop.is_set():
+            try:
+                if time.monotonic() >= next_run:
+                    try:
+                        self.compact()
+                    except Exception:
+                        pass
+
+                    try:
+                        self.purge_older_than()
+                    except Exception:
+                        pass
+
+                    next_run = time.monotonic() + self._retention.compaction_interval_seconds
+
+                sleep_until = next_run
+                while time.monotonic() < sleep_until:
+                    if self._maintenance_stop.is_set():
+                        return
+                    sleep_for = min(1.0, sleep_until - time.monotonic())
+                    time.sleep(sleep_for)
+            except Exception:
+                time.sleep(60)
+                next_run = time.monotonic() + self._retention.compaction_interval_seconds
+
+    # ------------------------------------------------------------------
+    # Stats and diagnostics
+    # ------------------------------------------------------------------
 
     def get_db_size(self) -> Dict:
         """Get database and WAL file sizes in bytes."""
@@ -422,12 +566,27 @@ class MetricsStore:
             compacted_rows = int(cursor.fetchone()[0])
         return {"raw_rows": raw_rows, "compacted_rows": compacted_rows}
 
+    def get_stats(self) -> StorageStats:
+        """Get comprehensive runtime statistics."""
+        counts = self.get_row_counts()
+        sizes = self.get_db_size()
+        return StorageStats(
+            raw_rows=counts["raw_rows"],
+            compacted_rows=counts["compacted_rows"],
+            db_size_bytes=sizes["db"],
+            wal_size_bytes=sizes["wal"],
+            last_compaction_ts=int(self._last_compaction),
+            maintenance_runs=self._maintenance_runs,
+        )
+
     def vacuum(self) -> None:
         """Reclaim unused database space. Can be slow on large DBs."""
         with self._lock:
             self._conn.execute("VACUUM")
 
     def close(self) -> None:
+        self.stop_maintenance()
+        self.unsubscribe_from_bus()
         with self._lock:
             try:
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
