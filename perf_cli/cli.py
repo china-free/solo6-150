@@ -10,7 +10,7 @@ from . import __version__
 from .chart import ChartConfig, Series, render_line_chart
 from .daemon import get_status, start_background, stop_background
 from .sampler import MetricsSampler, SamplerConfig
-from .storage import MetricsStore
+from .storage import MetricsStore, RetentionConfig
 from .utils import format_duration, parse_duration
 
 
@@ -26,24 +26,48 @@ METRIC_UNITS = {
 }
 
 
+def _format_size(num_bytes: int) -> str:
+    if num_bytes >= 1024 * 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024 * 1024):.2f} GB"
+    if num_bytes >= 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024):.2f} MB"
+    if num_bytes >= 1024:
+        return f"{num_bytes / 1024:.2f} KB"
+    return f"{num_bytes} B"
+
+
 def _get_metric_unit(metric: str) -> str:
     return METRIC_UNITS.get(metric, "")
+
+
+def _build_retention_config(args: argparse.Namespace) -> RetentionConfig:
+    return RetentionConfig(
+        retention_days=args.retention_days,
+        compaction_age_seconds=args.compaction_after * 60,
+        compaction_interval_seconds=args.compaction_every * 60,
+        enable_auto_compaction=not args.no_auto_compact,
+    )
 
 
 def cmd_collect(args: argparse.Namespace) -> int:
     """Start collecting metrics."""
     disks = args.disk.split(",") if args.disk else None
     nets = args.net.split(",") if args.net else None
+    retention = _build_retention_config(args)
 
     if args.foreground:
         print("perf-cli: Starting foreground sampling (Ctrl+C to stop)...")
+        print(f"perf-cli: Retention: {retention.retention_days} days, "
+              f"compaction after {format_duration(retention.compaction_age_seconds)}")
         cfg = SamplerConfig(
             interval=args.interval,
             include_per_cpu=args.per_cpu,
             disk_filter=set(disks) if disks else None,
             net_filter=set(nets) if nets else None,
+            enable_maintenance=not args.no_maintenance,
+            retention=retention,
         )
-        with MetricsStore() as store:
+        with MetricsStore(retention=retention) as store:
             run_id = store.start_run(0)
             sampler = MetricsSampler(store, cfg)
             try:
@@ -59,8 +83,12 @@ def cmd_collect(args: argparse.Namespace) -> int:
                 interval=args.interval,
                 disks=disks,
                 nets=nets,
+                retention=retention,
+                enable_maintenance=not args.no_maintenance,
             )
             print(f"perf-cli: Started background sampler (PID {pid})")
+            print(f"perf-cli: Retention: {retention.retention_days} days, "
+                  f"compaction after {format_duration(retention.compaction_age_seconds)}")
             print(f"perf-cli: Stop with: perf-cli stop")
             print(f"perf-cli: View report with: perf-cli report --last 10m")
         except RuntimeError as e:
@@ -80,7 +108,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """Show collector status."""
+    """Show collector status and database info."""
     status = get_status()
     if status["running"]:
         print(f"perf-cli: Collector is RUNNING (PID {status['pid']})")
@@ -91,6 +119,21 @@ def cmd_status(args: argparse.Namespace) -> int:
                 print(f"perf-cli: Running for {format_duration(elapsed)}")
     else:
         print("perf-cli: Collector is NOT running")
+
+    with MetricsStore() as store:
+        sizes = store.get_db_size()
+        counts = store.get_row_counts()
+        print()
+        print("Database:")
+        print(f"  Path: {store.db_path}")
+        print(f"  Size: {_format_size(sizes['total'])} (db: {_format_size(sizes['db'])}, "
+              f"wal: {_format_size(sizes['wal'])})")
+        print(f"  Raw points: {counts['raw_rows']:,}")
+        print(f"  Compacted points: {counts['compacted_rows']:,}")
+        if counts["raw_rows"] > 0:
+            ratio = counts["raw_rows"] / max(1, counts["compacted_rows"]) if counts["compacted_rows"] > 0 else 0
+            if ratio > 0:
+                print(f"  Compaction ratio: {ratio:.1f}x raw points per compacted point")
     return 0
 
 
@@ -179,14 +222,47 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_compact(args: argparse.Namespace) -> int:
+    """Manually trigger database compaction and purge."""
+    retention = _build_retention_config(args)
+    with MetricsStore(retention=retention) as store:
+        print("perf-cli: Running compaction...")
+        before = store.get_row_counts()
+        before_size = store.get_db_size()
+
+        compact_stats = store.compact(force=True)
+        print(f"  Compact: {compact_stats['status']}")
+        if compact_stats["status"] == "ok":
+            print(f"    Compacted {compact_stats.get('rows_compacted', 0):,} raw rows -> "
+                  f"{compact_stats.get('rows_inserted', 0):,} compacted rows")
+
+        print("perf-cli: Purging old data...")
+        purged = store.purge_older_than(args.retention_days)
+        print(f"  Purged {purged:,} rows")
+
+        if args.vacuum:
+            print("perf-cli: Vacuuming database...")
+            store.vacuum()
+
+        after = store.get_row_counts()
+        after_size = store.get_db_size()
+        print()
+        print("Summary:")
+        print(f"  Raw rows: {before['raw_rows']:,} -> {after['raw_rows']:,} "
+              f"(-{before['raw_rows'] - after['raw_rows']:,})")
+        print(f"  Compacted rows: {before['compacted_rows']:,} -> {after['compacted_rows']:,}")
+        print(f"  DB size: {_format_size(before_size['total'])} -> {_format_size(after_size['total'])}")
+
+    return 0
+
+
 def cmd_purge(args: argparse.Namespace) -> int:
     """Purge old data from the database."""
-    days = args.days
     with MetricsStore() as store:
-        deleted = store.purge_older_than(days)
+        deleted = store.purge_older_than(args.days)
         if args.vacuum:
             store.vacuum()
-    print(f"perf-cli: Deleted {deleted} data points older than {days} days.")
+    print(f"perf-cli: Deleted {deleted:,} data points older than {args.days} days.")
     if args.vacuum:
         print("perf-cli: Database vacuumed.")
     return 0
@@ -208,12 +284,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_collect.add_argument("--per-cpu", action="store_true", help="Sample per-core CPU usage")
     p_collect.add_argument("--disk", type=str, default=None, help="Filter disk devices (comma-separated)")
     p_collect.add_argument("--net", type=str, default=None, help="Filter network interfaces (comma-separated)")
+    p_collect.add_argument("--retention-days", type=int, default=7,
+                           help="Number of days to keep data (default: 7)")
+    p_collect.add_argument("--compaction-after", type=int, default=1440,
+                           help="Compact data older than N minutes (default: 1440 = 24h)")
+    p_collect.add_argument("--compaction-every", type=int, default=60,
+                           help="Run compaction every N minutes (default: 60)")
+    p_collect.add_argument("--no-auto-compact", action="store_true",
+                           help="Disable automatic data compaction")
+    p_collect.add_argument("--no-maintenance", action="store_true",
+                           help="Disable background maintenance thread entirely")
     p_collect.set_defaults(func=cmd_collect)
 
     p_stop = sub.add_parser("stop", help="Stop the background collector")
     p_stop.set_defaults(func=cmd_stop)
 
-    p_status = sub.add_parser("status", help="Show collector status")
+    p_status = sub.add_parser("status", help="Show collector status and database info")
     p_status.set_defaults(func=cmd_status)
 
     p_list = sub.add_parser("list", help="List available metrics in the database")
@@ -226,6 +312,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--height", type=int, default=20, help="Chart height in lines")
     p_report.add_argument("--no-grid", action="store_true", help="Disable background grid")
     p_report.set_defaults(func=cmd_report)
+
+    p_compact = sub.add_parser("compact", help="Manually compact the database")
+    p_compact.add_argument("--retention-days", type=int, default=7,
+                           help="Purge data older than N days (default: 7)")
+    p_compact.add_argument("--compaction-after", type=int, default=1440,
+                           help="Compact data older than N minutes (default: 1440 = 24h)")
+    p_compact.add_argument("--compaction-every", type=int, default=60,
+                           help="Ignored for manual compact, provided for consistency")
+    p_compact.add_argument("--no-auto-compact", action="store_true",
+                           help="Ignored for manual compact, provided for consistency")
+    p_compact.add_argument("--vacuum", action="store_true", help="Vacuum the database after compaction")
+    p_compact.set_defaults(func=cmd_compact)
 
     p_purge = sub.add_parser("purge", help="Remove old data from the database")
     p_purge.add_argument("--days", type=int, default=7, help="Delete data older than N days")

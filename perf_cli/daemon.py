@@ -60,17 +60,32 @@ def start_background(
     disks: Optional[list] = None,
     nets: Optional[list] = None,
     db_path: Optional[Path] = None,
+    retention: Optional["RetentionConfig"] = None,
+    enable_maintenance: bool = True,
 ) -> int:
     """Start the sampler as a background process. Returns the PID."""
+    from .storage import RetentionConfig
+
     existing = read_pid()
     if existing is not None:
         raise RuntimeError(f"Collector is already running with PID {existing}")
+
+    retention_dict = None
+    if retention is not None:
+        retention_dict = {
+            "retention_days": retention.retention_days,
+            "compaction_age_seconds": retention.compaction_age_seconds,
+            "compaction_interval_seconds": retention.compaction_interval_seconds,
+            "enable_auto_compaction": retention.enable_auto_compaction,
+        }
 
     config = json.dumps({
         "interval": interval,
         "disk_filter": list(disks) if disks else None,
         "net_filter": list(nets) if nets else None,
         "db_path": str(db_path) if db_path else None,
+        "retention": retention_dict,
+        "enable_maintenance": enable_maintenance,
     })
 
     project_root = str(Path(__file__).resolve().parent.parent)

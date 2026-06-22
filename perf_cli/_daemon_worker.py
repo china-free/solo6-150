@@ -8,7 +8,7 @@ import time
 
 from .daemon import clear_pid, write_pid
 from .sampler import MetricsSampler, SamplerConfig
-from .storage import MetricsStore
+from .storage import MetricsStore, RetentionConfig
 
 
 def _handler(signum, frame):
@@ -31,15 +31,28 @@ def main():
         disk_filter = set(cfg["disk_filter"]) if cfg.get("disk_filter") else None
         net_filter = set(cfg["net_filter"]) if cfg.get("net_filter") else None
         db_path = cfg.get("db_path")
+        enable_maintenance = bool(cfg.get("enable_maintenance", True))
+
+        retention_cfg = None
+        if "retention" in cfg and cfg["retention"]:
+            r = cfg["retention"]
+            retention_cfg = RetentionConfig(
+                retention_days=int(r.get("retention_days", 7)),
+                compaction_age_seconds=int(r.get("compaction_age_seconds", 86400)),
+                compaction_interval_seconds=int(r.get("compaction_interval_seconds", 3600)),
+                enable_auto_compaction=bool(r.get("enable_auto_compaction", True)),
+            )
 
         write_pid(os.getpid())
 
-        store = MetricsStore(db_path)
+        store = MetricsStore(db_path, retention=retention_cfg)
         run_id = store.start_run(os.getpid())
         sampler_cfg = SamplerConfig(
             interval=interval,
             disk_filter=disk_filter,
             net_filter=net_filter,
+            enable_maintenance=enable_maintenance,
+            retention=retention_cfg,
         )
         sampler = MetricsSampler(store, sampler_cfg)
         sampler.run()
@@ -50,7 +63,10 @@ def main():
         try:
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, "a") as f:
+                import traceback
                 f.write(f"[{time.ctime()}] {e}\n")
+                f.write(traceback.format_exc())
+                f.write("\n---\n")
         except Exception:
             pass
     finally:
